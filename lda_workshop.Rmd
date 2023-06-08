@@ -1,0 +1,417 @@
+---
+output: html_document
+title: "Simulations and analysis for LDA workshop"
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(dev="png", dpi=150, out.width="60%")
+library(knitr)
+library(kableExtra)
+```
+
+# Preliminaries
+
+```{r preliminaries, message=F}
+library(tidyverse)
+library(longsim)
+library(lme4)
+library(lmerTest)
+```
+
+# Generate simulated data
+
+A longitudinal dataset will be simulated using the *longsim* package. Here, we create a wrapper function that calls various *longsim* simulation functions (simulate_exposure(), simulate_covariate(), etc.), converts each dataset into "long" format, and joins them to create a single dataset ready for analysis.
+
+```{r simulate-long-data}
+generate_dataset <- function(
+  N = 1000,  # Number of individuals
+  K = 4,  # Number of timepoints
+  
+  maf = 0.25,  # Minor allele frequency
+  
+  icc_C = 0.8,  # ICC for covariate
+  var_e_C = 1,  # Error variance for covariate
+
+  beta_CE = 0,  # C-E effect size
+  icc_E = 0.5,  # ICC for exposure
+  var_e_E = 1,  # Error variance for exposure
+  
+  beta_tY = -1,  # Slope with respect to time
+  beta_GY = 0.5,  # Genotype effect size
+  beta_CY = 0,  # C-Y effect size
+  beta_EY = 1,  # E-Y effect size
+  icc_Y = 0.8,  # ICC for outcome (across repeated measures)
+  var_e_Y = 1  # Error variance for outcome
+) {
+  simulate_long_data(  # High-level function from the longsim package
+    N, K, 
+    maf, 
+    icc_C, var_e_C,
+    beta_CE, icc_E, var_e_E,
+    beta_tY, beta_GY, beta_CY, beta_EY, icc_Y, var_e_Y
+  )
+}
+
+set.seed(1)
+long_df <- generate_dataset()
+```
+
+# Visualization
+
+Using the simulated dataset, we can first generate a few visualizations to gain some familiarity with its attributes and patterns.
+
+```{r viz}
+long_df %>%
+  slice(1:100) %>%
+  ggplot(aes(x=t, y=Y, group=id)) +
+  geom_point() +
+  geom_line()
+
+long_df %>%
+  slice(1:100) %>%
+  ggplot(aes(x=G, y=Y)) +
+  geom_boxplot(aes(group=G)) +
+  geom_point() +
+  scale_x_continuous(breaks=0:2)
+
+lmm_fit <- lmer(Y ~ G + E + (1|id), data=long_df)
+long_df$Y_pred <- predict(lmm_fit)
+long_df %>%
+  filter(id %in% 1:5) %>%
+  ggplot(aes(x=E, y=Y, color=id)) +
+  geom_point(data=slice(long_df, 1:100), color="gray") +
+  geom_point() +
+  geom_line(aes(y=Y_pred), linewidth=1)
+```
+
+We see trends in Y based on time, genotype, and exposure. To plot person-specific E-Y regression lines, we will fit a linear mixed model incorporating a random intercept, then use the predict.lmm() function to generate predicted values that incorporate this heterogeneity in the intercept.
+
+# Analysis
+
+## The basic LMM
+
+For most longitudinal data analyses, data should be converted into "long" format, with one row per timepoint (/observation), rather than one row per person. The columns of this dataset include a person-specific ID and timepoint (each row should have a unique combination of these two), time-varying fields (such as outcome Y and exposure E), and time-constant fields (such as genotype G). The primary goal of this analysis will be to estimate the effect of the time-varying exposure E on the outcome Y, which will be simulated as 1 unless otherwise noted.
+
+```{r raw-dataset-viz}
+print(head(long_df))
+```
+
+Next, we will fit our first linear mixed model (LMM) on the dataset. Though multiple packages and function exist for fitting LMMs, we will use the lmer() function from the *lme4* package. Note the syntax used to include a random intercept per person in the regression formula: "(1|id)". 
+
+Using this primary dataset, what do the results look like?
+
+```{r primary-dataset}
+primary_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_df)
+
+summary(primary_lmm_fit)
+```
+
+Two notes on the LMM summary above:
+
+1. The "Fixed effects" section should look very similar to the results from a standard linear regression, with estimates, *p*-values, etc. for an intercept and any covariates included in the model.
+2. The "Random effects" section shows how the model has estimated or "partitioned" the variability in Y between the person-specific intercept and remaining error/residual variance. Here, we know that this estimate should be far from zero since the dataset was simulated to have substantial within-person clustering. (Note: the "Std.Dev." column contains the simple square root of the variance estimates, rather than a standard error for the variance estimate itself.)
+
+## Comparison to non-LMM options
+
+First, we define some helper functions to facilitate comparison of results across regression fits. The goal will be to produce (1) tables displaying both fixed effects estimates (formatted as "estimate (standard error)") and variance estimates for the random effects and residual variance, and (2) plots comparing estimates and confidence intervals for the E effect across models.
+
+```{r lmm-comparison-funcs}
+extract_lmm_estimates <- function(fit) {
+  
+  # Given a linear model or LMM fit, extract fixed effects and variance estimates
+  
+  FEs <- summary(fit)$coefficients %>%
+    as_tibble(rownames="term") %>%
+    mutate(across(c(Estimate, `Std. Error`), ~ round(., 3)),
+           estimate = paste0(Estimate, " (", `Std. Error`, ")")) %>%
+    select(term, estimate)
+  VCs <- if (class(fit) == "lm") {
+    residual_variance <- round(summary(fit)$sigma^2, 3)
+    tibble(term = "Variance - Residual",
+           estimate = as.character(residual_variance))
+  } else {
+    as.data.frame(VarCorr(fit)) %>%
+    mutate(term = paste0("Variance - ", grp),
+           variance = as.character(round(vcov, 3))) %>%
+    select(term, estimate=variance)
+  }
+  bind_rows(FEs, VCs) %>%
+    setNames(c("Term", "Estimate (SE)"))
+}
+
+compare_lmm_estimates <- function(lmm_list) {
+  
+  # Given a list of two or more model estimates from extract_lmm_estimates(),
+  # create a data frame for comparison of results 
+  
+  estimates_list <- lapply(lmm_list, extract_lmm_estimates)
+  comparison_df <- reduce(estimates_list, function(x, y) {
+    full_join(x, y, by="Term")
+  })
+  setNames(comparison_df, c("Term", names(lmm_list)))
+}
+
+print_comparison_tbl <- function(tbl, caption="") {
+  tbl %>% 
+    kable(caption=caption) %>%
+    kable_styling(full_width=FALSE)
+}
+
+plot_comparison <- function(tbl, fct_levels=NULL) {
+  if (is.null(fct_levels)) fct_levels <- names(tbl)[-1]
+  tbl %>%
+    pivot_longer(-Term, names_to="model", values_to="value") %>%
+    filter(!is.na(value),
+           grepl("E", Term)) %>%
+    mutate(
+      model = factor(model, levels=fct_levels),
+      estimate = as.numeric(gsub(" \\(.*", "", value)),
+      SE = as.numeric(gsub(".*\\(|\\)", "", value))
+    ) %>%
+    ggplot(aes(x=model, y=estimate)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = estimate - 1.96 * SE, ymax = estimate + 1.96 * SE),
+                  width=0.1) +
+    geom_hline(yintercept=1, linetype="dashed", color="gray") +
+    labs(x="Model", y=expression("E effect (" * beta[E] * ") estimate (95% CI)"))
+}
+```
+
+We have various options for modeling this dataset using standard linear regression (LR):
+
+* Use E & Y from only the first timepoint
+* Take the mean E and Y across all timepoints
+* Use all timepoints and simply ignore the within-person correlation
+
+```{r primary-lm-variations}
+# LR using first timepoint
+lm_timept1_fit <- lm(Y ~ G + E, data=filter(long_df, timept == "t1"))
+
+# LR using mean values
+lm_mean_fit <- lm(Y ~ G + E,
+              data=summarise(group_by(long_df, id), 
+                             Y=mean(Y), G=G[1], E=mean(E)))
+
+# LR using all datapoints
+lm_all_fit <- lm(Y ~ G + E, data=long_df)
+
+lm_comparison_df <- compare_lmm_estimates(list(
+  LMM = primary_lmm_fit,
+  `LR - 1st timept` = lm_timept1_fit,
+  `LR - Mean values` = lm_mean_fit,
+  `LR - Ignore clustering` = lm_all_fit
+)) 
+
+print_comparison_tbl(lm_comparison_df)
+plot_comparison(lm_comparison_df)
+```
+
+Notes:
+
+* The LMM estimate for the E effect matches the true value of 1 almost exactly.
+* Estimates from both the "first timepoint" and "mean" approaches are slightly off, while having substantially larger SEs due to the loss of information by removing/collapsing data points.
+* When ignoring the correlation but using all timepoints, the effect estimates are not substantially affected, but the standard errors are still larger. This is because the LMM can attribute a substantial amount of variability in Y to the person-specific (random) intercept, while the LR assigns this variability to residual error. (Note: In this case, ignoring longitudinal correlation is overly conservative (higher SEs -> higher p-values), but in other situations it can also be overly aggressive and produce false positives.)
+
+In summary, LMMs provide the flexibility to effectively use all available longitudinal data, while approaches based on standard LR tend to produce effect estimates with poorly-calibrated SEs (producing false positives and/or false negatives).
+
+## Cross-sectional versus longitudinal effects: leveraging within-person comparisons
+
+LMMs have access to two sources of information: cross-sectional (between-person) comparisons and longitudinal (within-person) comparisons. To see when this might come in handy, we will simulate a similar dataset that includes a time-constant confounder of the E-Y relationship.
+
+Then, we can test a series of models:
+
+* LMM, adjusted for C (this should recover the correct E effect estimate)
+* LR, adjusted for C (this effect estimate should be similar, but with larger SEs)
+
+Now, assume the true C is either unknown, unmeasured, or badly measured:
+
+* LR, unadjusted for C
+* LMM, unadjusted for C
+* "Decomposed" model: estimate effects for both baseline E (cross-sectional estimate) and deltas from baseline E (longitudinal estimate)
+* Baseline E-adjusted model: the basic LMM but adjusted for baseline E
+
+```{r cs-versus-longitudinal, out.width="80%"}
+long_df <- generate_dataset(icc_C=1, beta_CE=1, beta_CY=1)  # ICC_C of 1 means no change over time
+long_diff_df <- long_df %>%
+  group_by(id) %>%
+  mutate(E_bl = E[timept == "t1"],
+         Y_bl = Y[timept == "t1"],
+         E_diff = E - E[timept == "t1"]) %>%
+  ungroup()
+
+confounded_adj_lmm_fit <- lmer(Y ~ t + G + E + C + (1|id), data=long_diff_df)
+confounded_adj_lr_fit <- lm(Y ~ t + G + E + C, data=long_diff_df)
+confounded_unadj_lr_fit <- lm(Y ~ t + G + E, data=long_diff_df)
+confounded_unadj_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_diff_df)
+confounded_decomp_lmm_fit <- lmer(Y ~ t + G + E_bl + E_diff + (1|id), data=long_diff_df)
+confounded_adj_bl_E_fit <- lmer(Y ~ t + G + E + E_bl + (1|id), data=long_diff_df)
+
+decomp_comparison_df <- compare_lmm_estimates(list(
+  `Adjusted\nLMM` = confounded_adj_lmm_fit,
+  `Adjusted\nLR` = confounded_adj_lr_fit,
+  `Unadjusted\nLR` = confounded_unadj_lr_fit,
+  `Unadjusted\nLMM` = confounded_unadj_lmm_fit,
+  `Decomposed\nLMM` = confounded_decomp_lmm_fit,
+  `BL E-adjusted\nLMM` = confounded_adj_bl_E_fit
+))
+
+print_comparison_tbl(decomp_comparison_df)
+
+decomp_comparison_df %>%
+  pivot_longer(-Term, names_to="model", values_to="value") %>%
+  filter(!is.na(value),
+         grepl("E", Term)) %>%
+  mutate(model = factor(model, levels=names(decomp_comparison_df)[-1]),
+         estimate = as.numeric(gsub(" \\(.*", "", value)),
+         SE = as.numeric(gsub(".*\\(|\\)", "", value))) %>%
+  ggplot(aes(x=model, y=estimate, color=Term)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = estimate - 1.96 * SE, ymax = estimate + 1.96 * SE),
+                width=0.1) +
+  geom_hline(yintercept=1, linetype="dashed", color="gray") +
+  labs(x="Model", y=expression("E effect (" * beta[E] * ") estimate (95% CI)"))
+```
+
+What do we observe?
+
+* When adjusting for a known and measured confounder, LR and LMM both produce correct effect estimates (with larger SEs for the LR for the reasons discussed above).
+* The unadjusted LR estimate is highly biased due to confounding.
+* The unadjusted LMM estimate is much closer to the true value! This is because, under the hood, the LMM is balancing contributions from a confounded between-person comparison and an unconfounded within-person comparison (conceptually, the relationship between $\Delta E$ and $\Delta Y$).
+* The decomposed model makes this compromise clear by separately estimating cross-sectional/baseline effects (E_bl) and longitudinal effects (E_diff).
+* The baseline E-adjusted model is mathematically equivalent to the "decomposed" model: the estimate and SEs for E (from the BL-adjusted E model) and E_diff (from the decomposed model) are identical.
+
+What happens if we cut the number of timepoints in half in the context of this time-constant confounder?
+
+```{r cs-versus-longitudinal-smaller-K}
+long_diff_df <- filter(long_diff_df, timept %in% c("t1", "t2"))
+confounded_smaller_K_unadj_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_diff_df)
+
+smaller_K_comparison_df <- compare_lmm_estimates(list(
+  `Decomposed LMM (K = 4)` = confounded_decomp_lmm_fit,
+  `Unadj. LMM (K = 4)` = confounded_unadj_lmm_fit,
+  `Unadj. LMM (K = 2)` = confounded_smaller_K_unadj_lmm_fit
+)) 
+
+plot_comparison(smaller_K_comparison_df)
+```
+
+With a smaller K, there is less longitudinal information for the model to use in estimating within-person effects, so its estimate will be weighted relatively more towards the (confounded) between-person estimate.
+
+**Technical note:** The "time-constant" confounder doesn't actually have to be constant over time to see this type of benefit from the LMM! The important part is that the confounder is clustered to some degree such that people vary in their typical value for that trait. For example, socioeconomic status or health-consciousness may not be strictly constant in a given person, yet most people will tend to have similar values for these traits over time.
+
+To see this, we can simulate a series of confounded datasets, varying the ICC for C from 0 (no within-person correlation) to 1 (time-constant).
+
+```{r cs-versus-longitudinal-varying-ICC}
+long_df <- generate_dataset(icc_C=0, beta_CE=1, beta_CY=1)
+confounded_icc0_unadj_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_df)
+long_df <- generate_dataset(icc_C=0.5, beta_CE=1, beta_CY=1)
+confounded_icc0.5_unadj_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_df)
+long_df <- generate_dataset(icc_C=1, beta_CE=1, beta_CY=1)
+confounded_icc1_unadj_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_df)
+
+smaller_K_comparison_df <- compare_lmm_estimates(list(
+  `Unadj. LMM (ICC_C = 0)` = confounded_icc0_unadj_lmm_fit,
+  `Unadj. LMM (ICC_C = 0.5)` = confounded_icc0.5_unadj_lmm_fit,
+  `Unadj. LMM (ICC_C = 1)` = confounded_icc1_unadj_lmm_fit
+)) 
+
+plot_comparison(smaller_K_comparison_df)
+```
+
+Despite the magnitude of confounding being identical in each of the above models, the estimates are very different. As within-person consistency in the confounder value increases (i.e., higher ICC), the random intercept is better able to capture and adjust for its effect, allowing the model to recover an estimate closer to the true value.
+
+## Effects of other model parameters
+
+### What happens if the outcome variable is less tightly clustered by person?
+
+```{r lower-clustering}
+long_df <- generate_dataset(icc_Y=0.2)
+lower_icc_Y_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_df)
+lower_icc_Y_lr_fit <- lm(Y ~ t + G + E, data=long_df)
+
+lower_icc_comparison_df <- compare_lmm_estimates(list(
+  Primary = primary_lmm_fit,
+  `Primary - LR` = lm_all_fit,
+  `Less Y clustering - LMM` = lower_icc_Y_lmm_fit,
+  `Less Y clustering - LR` = lower_icc_Y_lr_fit
+))
+
+print_comparison_tbl(lower_icc_comparison_df)
+plot_comparison(lower_icc_comparison_df)
+```
+
+When Y is less clustered, less of the variability can be attributed by the LMM to the random intercept. So, as seen in the two estimates on the right, LMM loses its "advantage" and the SEs are similar compared to LR.
+
+### What happens if we change the degree of clustering in the exposure?
+
+```{r clustered-E}
+long_df <- generate_dataset(icc_E=0.1)
+low_icc_E_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_df)
+long_df <- generate_dataset(icc_E=0.9)
+high_icc_E_lmm_fit <- lmer(Y ~ t + G + E + (1|id), data=long_df)
+
+icc_E_comparison_df <- compare_lmm_estimates(list(
+  `Less-clustered E` =  low_icc_E_lmm_fit,
+  Primary = primary_lmm_fit,
+  `More-clustered E` = high_icc_E_lmm_fit
+))
+
+plot_comparison(icc_E_comparison_df)
+```
+
+The more clustered E is (moving to the right in the plot), the more similar a person's E value is to their value at other timepoints. This means the model has less within-person variability in E to use in estimating its effect, so the effect estimate remains similar but with less confidence (higher SEs).
+
+# Additional visualizations
+
+```{r viz2}
+set.seed(1)
+
+long_df <- generate_dataset()
+
+long_df %>%
+  ggplot(aes(x=t, y=Y, group=id)) +
+  geom_point() +
+  geom_line()
+
+long_df %>%
+  ggplot(aes(x=t, y=Y, group=id)) +
+  geom_point() +
+  geom_line() +
+  geom_hline(yintercept=mean(long_df$Y), linetype="dashed", color="red")
+
+long_df %>%
+  ggplot(aes(x=t, y=Y, group=id)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(aes(group=1), method="lm", formula="y ~ x", se=FALSE, 
+              linetype="dashed", color="red")
+
+long_df %>%
+  ggplot(aes(x=G, y=Y)) +
+  geom_point()
+
+long_df %>%
+  ggplot(aes(x=G, y=Y)) +
+  geom_point() +
+  geom_smooth(aes(group=1), method="lm", formula="y ~ x", se=FALSE, 
+              linetype="dashed", color="red")
+
+long_df %>%
+  ggplot(aes(x=E, y=Y)) +
+  geom_point()
+
+long_df %>%
+  ggplot(aes(x=E, y=Y)) +
+  geom_point() +
+  geom_smooth(aes(group=1), method="lm", formula="y ~ x", se=FALSE, 
+              linetype="dashed", color="red")
+
+lmm_fit <- lmer(Y ~ G + E + (1|id), data=long_df)
+long_df$Y_pred <- predict(lmm_fit)
+long_df %>%
+  filter(id %in% 1:5) %>%
+  ggplot(aes(x=E, y=Y, color=id)) +
+  geom_point(data=slice(long_df, 1:100), color="gray") +
+  geom_point() +
+  geom_line(aes(y=Y_pred), linewidth=1)
+```

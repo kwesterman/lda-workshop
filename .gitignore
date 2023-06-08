@@ -1,0 +1,14 @@
+# Reference materials
+reference/*
+
+# Archival scripts and presentation versions
+archive/*
+
+# Don't track .pptx (only PDF version)
+*.pptx
+
+# Mac files
+.DS_Store
+
+# R files
+.Rhistory
