@@ -9,6 +9,44 @@ library(knitr)
 library(kableExtra)
 ```
 
+# Background
+
+Longitudinal datasets contain repeated measurements over time. They can arise from both observational studies and intervention trials, but we will focus on observational data here.
+
+Analysis of longitudinal data has several advantages:
+
+* Greater statistical data from more data points
+* Biomarker trajectories (can be more complex than simple mean differences)
+* Within-person comparisons for which some types of confounding are less relevant
+
+However, there are a few challenges that need to be accounted for during modeling:
+
+* Repeated measures are correlated with each other -- two measurements from the same person at different times will tend to be more similar than two measurements from different people.
+* Variance may not be constant across time (i.e., heteroscedasticity) -- this is more of a concern in the context of intervention trials, so we won't focus on it here.
+
+**Objective:** To understand how longitudinal data can leverage within-person comparisons to improve the estimation of effects in complex trait epidemiology.
+
+1. Introduce the linear mixed model (LMM) statistical framework
+2. Demonstrate how to fit an LMM and interpret the results using simulated longitudinal data
+
+# Linear mixed models
+
+LMMs account for the expected similarity or correlation between specific observations in a dataset. The simplest way to account for this correlation is via a random intercept, which gives every individual a slightly different mean. Under the hood, this ends up fitting one single correlation describing the similarity of all values coming from the same individual. This means that (1) the correlation between two measurements from person A and two from person B are assumed to be the same, and (2) all measurements from a given person are assumed to be exchangeable, meaning that the similarity of two measurements doesn't change if they are flipped or are farther apart in time.
+
+Two extensions of this implicit model (that we won't discuss further here) are: more complicated covariances (e.g., autoregressive models that expect the correlation between two measurements to decrease the farther apart they are in time) and random slopes (in which individuals have unique covariate effects, not just intercepts).
+
+Next, we introduce the LMM that will be used in simulations below:
+
+$Y_{ij} = \beta_0 + \beta_1t_{ij} + \beta_2g_i +\beta_3e_{ij} + X^T_{ij}\beta_C + b_{1i} + \epsilon_{ij}$
+
+* $Y_{ij}$: Outcome measurement for subject i at timepoint j
+* $t_{ij}$: Time of measurement
+* $g_i$: Genotype
+* $e_{ij}$: Exposure measurement (e.g., some dietary behavior)
+* $X^T_{ij}$: Vector of covariates
+* $b_{1i}$: Random intercept
+* $\epsilon_{ij}$: Additional random error
+
 # Preliminaries
 
 ```{r preliminaries, message=F}
